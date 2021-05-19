@@ -1,4 +1,4 @@
-module github.com/filecoin-project/sentinel-miner-locations
+module github.com/filecoin-project/sentinel-locations
 
 go 1.16
 

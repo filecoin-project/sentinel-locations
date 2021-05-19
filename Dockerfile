@@ -20,7 +20,7 @@ RUN go install -trimpath -mod=readonly -ldflags "-X main.tag=$(git describe)"
 FROM busybox:1-glibc
 MAINTAINER Hector Sanjuan <hector@protocol.ai>
 
-ENV GOPATH                 /go
+ENV GOPATH      /go
 ENV SRC_PATH    $GOPATH/src/github.com/filecoin-project/sentinel-locations
 
 COPY --from=builder $GOPATH/bin/sentinel-locations /usr/local/bin/sentinel-locations
