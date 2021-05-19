@@ -28,6 +28,8 @@ type minerInfo struct {
 	MinerID        string   `pg:",pk,notnull"`
 	MultiAddresses []string `pg:"-"`
 	CountryName    string   `pg:",notnull"`
+	Latitude       int      `pg:",notnull"`
+	Longitude      int      `pg:",notnull"`
 }
 
 type minerInfos []minerInfo
@@ -192,6 +194,8 @@ func lookupLocations(ctx context.Context, loc *ipfsgeoip.IPLocator, infos minerI
 					continue
 				}
 				info.CountryName = geo.CountryName
+				info.Latitude = int(geo.Latitude * 1000000)
+				info.Longitude = int(geo.Longitude * 1000000)
 				locatedMiners = append(locatedMiners, info)
 				break
 			}
