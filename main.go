@@ -7,16 +7,20 @@ import (
 	"os"
 	"time"
 
+	crypto "github.com/libp2p/go-libp2p-core/crypto"
+
 	pg "github.com/go-pg/pg/v10"
 	orm "github.com/go-pg/pg/v10/orm"
+
 	ipfsgeoip "github.com/hsanjuan/go-ipfs-geoip"
 	ipfslite "github.com/hsanjuan/ipfs-lite"
-	crypto "github.com/libp2p/go-libp2p-core/crypto"
+
 	multiaddr "github.com/multiformats/go-multiaddr"
 	madns "github.com/multiformats/go-multiaddr-dns"
 )
 
 const schema = "locations"
+const crawlTime = time.Duration(10) * time.Second
 
 //go:embed query.sql
 var query string
@@ -30,6 +34,7 @@ type minerInfo struct {
 	CountryName    string   `pg:",notnull"`
 	Latitude       int      `pg:",notnull"`
 	Longitude      int      `pg:",notnull"`
+	Source         string   `pg:",notnull"`
 }
 
 type minerInfos []minerInfo
@@ -56,6 +61,13 @@ func main() {
 	}
 	defer db.Close()
 
+	fp, err := getRouter(ctx)
+	if err != nil {
+		log.Println("error setting up FilecoinPeer")
+		log.Fatal(err)
+	}
+	defer fp.host.Close()
+
 	// This bootstraps IPFS while we get miner infos.
 	loc, err := getLocator(ctx)
 	if err != nil {
@@ -63,7 +75,7 @@ func main() {
 		log.Fatal(err)
 	}
 
-	infos, err := getMinerInfos(db)
+	infos, err := getMinerInfos(db, fp)
 	if err != nil {
 		log.Println("error obtaining list of miner infos")
 		log.Fatal(err)
@@ -82,6 +94,7 @@ func main() {
 		log.Println("error inserting miner location information")
 		log.Fatal(err)
 	}
+
 }
 
 func connectToDB() (*pg.DB, error) {
@@ -113,12 +126,21 @@ func connectToDB() (*pg.DB, error) {
 		return nil, err
 	}
 
+	if _, err = db.ExecContext(
+		ctx,
+		"ALTER TABLE "+schema+".miners ADD COLUMN IF NOT EXISTS source VARCHAR(24);",
+	); err != nil {
+		db.Close()
+		return nil, err
+	}
+
 	return db, nil
 }
 
 func getLocator(ctx context.Context) (*ipfsgeoip.IPLocator, error) {
 	ds := ipfslite.NewInMemoryDatastore()
 	priv, _, err := crypto.GenerateKeyPair(crypto.RSA, 2048)
+
 	if err != nil {
 		return nil, err
 	}
@@ -143,19 +165,73 @@ func getLocator(ctx context.Context) (*ipfsgeoip.IPLocator, error) {
 
 	go lite.Bootstrap(ipfslite.DefaultBootstrapPeers())
 
-	// An exchange session will speed things up
 	return ipfsgeoip.NewIPLocator(lite.Session(ctx)), nil
 }
 
-func getMinerInfos(db *pg.DB) ([]minerInfo, error) {
+func getRouter(ctx context.Context) (*FilecoinPeer, error) {
+	fp, err := SetupFilecoinPeer(
+		ctx,
+		"mainnet",
+	)
+
+	if err != nil {
+		return &FilecoinPeer{}, nil
+	}
+
+	fp.Crawl(crawlTime)
+
+	return fp, nil
+}
+
+func getMinerInfos(db *pg.DB, fp *FilecoinPeer) ([]minerInfo, error) {
 	// Tl;dr: get latest known miner_id, multi_addresses, height for each
 	// miner.
-	var infos []minerInfo
-	_, err := db.Query(&infos, query)
+	knownPeers := fp.host.Peerstore().Peers()
+
+	var infosFromDb []minerInfo
+	var infosFromFp []minerInfo = make([]minerInfo, len(knownPeers))
+
+	_, err := db.Query(&infosFromDb, query)
 	if err != nil {
 		return nil, err
 	}
-	return infos, nil
+	for _, info := range infosFromDb {
+		info.Source = "self-report"
+	}
+
+	var height int64
+	if _, err := db.Model((*minerInfo)(nil)).QueryOne(pg.Scan(&height), `
+SELECT height FROM ?TableName
+ORDER BY height DESC
+LIMIT 1
+`); err != nil {
+		log.Println("could not find most recent height")
+		log.Fatal(err)
+	}
+	for _, peer := range knownPeers {
+		peerAddrs := fp.host.Peerstore().PeerInfo(peer).Addrs
+		peerAddrsAsStr := make([]string, len(peerAddrs))
+		for _, p := range peerAddrs {
+			peerAddrsAsStr = append(peerAddrsAsStr, p.String())
+		}
+
+		info := minerInfo{
+			Height:         height,        // use most recent height from locations table for now
+			MinerID:        peer.String(), // cannot reliably get miner ID given a peer ID from miner_infos table
+			MultiAddresses: peerAddrsAsStr,
+		}
+
+		if len(info.MultiAddresses) == 0 { // sometimes multiaddr not found in peerstore
+			continue
+		}
+
+		info.Source = "routing"
+		infosFromFp = append(infosFromFp, info)
+	}
+
+	log.Println("COUNT INFOS FROM FP")
+	log.Println(len(infosFromFp))
+	return append(infosFromDb, infosFromFp...), nil
 }
 
 // We make the assumption that it does not make sense if a miner reports IPs
