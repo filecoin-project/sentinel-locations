@@ -4,9 +4,6 @@ import (
 	"context"
 	"log"
 	"sync"
-	"time"
-
-	connmgr "github.com/libp2p/go-libp2p-connmgr"
 
 	ds "github.com/ipfs/go-datastore"
 	dsync "github.com/ipfs/go-datastore/sync"
@@ -15,7 +12,7 @@ import (
 
 	crypto "github.com/libp2p/go-libp2p-core/crypto"
 	host "github.com/libp2p/go-libp2p-core/host"
-	"github.com/libp2p/go-libp2p-core/peer"
+	peer "github.com/libp2p/go-libp2p-core/peer"
 	libp2ptls "github.com/libp2p/go-libp2p-tls"
 
 	ipns "github.com/ipfs/go-ipns"
@@ -28,14 +25,14 @@ import (
 	protocol "github.com/libp2p/go-libp2p-core/protocol"
 )
 
-type NetworkName string
+type networkName string
 
 const (
-	Mainnet  NetworkName = "mainnet"
-	Calibnet NetworkName = "calibnet"
+	mainnet  networkName = "mainnet"
+	calibnet networkName = "calibnet"
 )
 
-var MainnetPeers = []string{
+var mainnetPeers = []string{
 	"/dns4/bootstrap-0.mainnet.filops.net/tcp/1347/p2p/12D3KooWCVe8MmsEMes2FzgTpt9fXtmCY7wrq91GRiaC8PHSCCBj",
 	"/dns4/bootstrap-1.mainnet.filops.net/tcp/1347/p2p/12D3KooWCwevHg1yLCvktf2nvLu7L9894mcrJR4MsBCcm4syShVc",
 	"/dns4/bootstrap-2.mainnet.filops.net/tcp/1347/p2p/12D3KooWEWVwHGn2yR36gKLozmb4YjDJGerotAPGxmdWZx2nxMC4",
@@ -53,23 +50,24 @@ var MainnetPeers = []string{
 	"/dns4/bootstrap-1.ipfsmain.cn/tcp/34723/p2p/12D3KooWMKxMkD5DMpSWsW7dBddKxKT7L2GgbNuckz9otxvkvByP",
 }
 
-var CalibnetPeers = []string{
+var calibnetPeers = []string{
 	"/dns4/bootstrap-0.calibration.fildev.network/tcp/1347/p2p/12D3KooWJkikQQkxS58spo76BYzFt4fotaT5NpV2zngvrqm4u5ow",
 	"/dns4/bootstrap-1.calibration.fildev.network/tcp/1347/p2p/12D3KooWLce5FDHR4EX4CrYavphA5xS3uDsX6aoowXh5tzDUxJav",
 	"/dns4/bootstrap-2.calibration.fildev.network/tcp/1347/p2p/12D3KooWA9hFfQG9GjP6bHeuQQbMD3FDtZLdW1NayxKXUT26PQZu",
 	"/dns4/bootstrap-3.calibration.fildev.network/tcp/1347/p2p/12D3KooWMHDi3LVTFG8Szqogt7RkNXvonbQYqSazxBx41A5aeuVz",
 }
 
-type FilecoinPeer struct {
+type filecoinPeer struct {
 	ctx            context.Context
 	dht            *dht.IpfsDHT
 	host           host.Host
 	bootstrapPeers []peer.AddrInfo
+	foundMiners    []peer.AddrInfo
 }
 
-func FilecoinBootstrapPeers(peerList []string) []peer.AddrInfo {
+func filecoinBootstrapPeers(peerList []string) []peer.AddrInfo {
 	if peerList == nil {
-		peerList = MainnetPeers
+		peerList = mainnetPeers
 	}
 
 	maddrs := make([]multiaddr.Multiaddr, len(peerList))
@@ -78,7 +76,8 @@ func FilecoinBootstrapPeers(peerList []string) []peer.AddrInfo {
 		var err error
 		maddrs[i], err = multiaddr.NewMultiaddr(bp)
 		if err != nil {
-			return nil
+			log.Fatal(err)
+			continue
 		}
 	}
 
@@ -87,38 +86,34 @@ func FilecoinBootstrapPeers(peerList []string) []peer.AddrInfo {
 	return peers
 }
 
-func SetupFilecoinPeer(
+func setupFilecoinPeer(
 	ctx context.Context,
-	network NetworkName,
-) (*FilecoinPeer, error) {
+	network networkName,
+) (*filecoinPeer, error) {
 	if network == "" {
-		network = Mainnet
+		network = mainnet
 	}
 
 	var pp protocol.ID
 	var bootstrapPeers []peer.AddrInfo
 
 	switch network {
-	case Mainnet:
+	case mainnet:
 		pp = "/fil/kad/testnetnet"
-		bootstrapPeers = FilecoinBootstrapPeers(MainnetPeers)
-	case Calibnet:
+		bootstrapPeers = filecoinBootstrapPeers(mainnetPeers)
+	case calibnet:
 		pp = "/fil/kad/calibnet"
-		bootstrapPeers = FilecoinBootstrapPeers(CalibnetPeers)
+		bootstrapPeers = filecoinBootstrapPeers(calibnetPeers)
 	}
 
 	var ddht *dht.IpfsDHT
-	priv, _, err := crypto.GenerateKeyPair(crypto.RSA, 2048)
+	priv, _, err := crypto.GenerateKeyPair(crypto.Ed25519, -1)
 
 	if err != nil {
-		return &FilecoinPeer{}, err
+		return &filecoinPeer{}, err
 	}
 
 	libp2pOpts := []libp2p.Option{
-		libp2p.ListenAddrStrings(
-			"/ip4/0.0.0.0/tcp/9000",      // regular tcp connections
-			"/ip4/0.0.0.0/udp/9000/quic", // a UDP endpoint for the QUIC transport
-		),
 		libp2p.Identity(priv),
 		libp2p.Security(libp2ptls.ID, libp2ptls.New),
 		libp2p.Security(noise.ID, noise.New),
@@ -130,29 +125,25 @@ func SetupFilecoinPeer(
 				dht.Option(dht.Datastore(dsync.MutexWrap(ds.NewMapDatastore()))),
 				dht.Option(dht.NamespacedValidator("pk", record.PublicKeyValidator{})),
 				dht.Option(dht.NamespacedValidator("ipns", ipns.Validator{KeyBook: h.Peerstore()})),
-				dht.Option(dht.Concurrency(10)),
-				dht.Option(dht.Mode(dht.ModeAuto)),
+				dht.Option(dht.Concurrency(50)),
+				dht.Option(dht.Mode(dht.ModeClient)),
 				dht.Option(dht.ProtocolPrefix(pp)),
 			)
 
 			return ddht, err
 		}),
-		libp2p.NATPortMap(),
-		libp2p.ConnectionManager(connmgr.NewConnManager(100, 600, time.Minute)),
-		libp2p.EnableAutoRelay(),
-		libp2p.EnableNATService(),
 	}
 
 	h, err := libp2p.New(libp2pOpts...)
 
 	if err != nil {
-		return &FilecoinPeer{}, err
+		return &filecoinPeer{}, err
 	}
 
-	return &FilecoinPeer{ctx: ctx, host: h, dht: ddht, bootstrapPeers: bootstrapPeers}, nil
+	return &filecoinPeer{ctx: ctx, host: h, dht: ddht, bootstrapPeers: bootstrapPeers}, nil
 }
 
-func (f *FilecoinPeer) Bootstrap() {
+func (f *filecoinPeer) bootstrap() {
 	connected := make(chan struct{})
 
 	var wg sync.WaitGroup
@@ -174,25 +165,4 @@ func (f *FilecoinPeer) Bootstrap() {
 		wg.Wait()
 		close(connected)
 	}()
-}
-
-func (f *FilecoinPeer) Crawl(d time.Duration) {
-	// connect to bootstrap peers
-	go f.Bootstrap()
-
-	// use ticker instead of sleep to make up for slow receivers
-	stop := make(chan struct{}, 1)
-	stopTicker := time.NewTicker(d)
-
-	statusTicker := time.NewTicker(time.Duration(5) * time.Second)
-
-	for {
-		select {
-		case <-statusTicker.C:
-			log.Printf("found peers: %v\n", len(f.host.Peerstore().Peers()))
-		case <-stopTicker.C:
-			stop <- struct{}{}
-			return
-		}
-	}
 }

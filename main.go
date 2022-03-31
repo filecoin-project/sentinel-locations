@@ -5,9 +5,11 @@ import (
 	_ "embed"
 	"log"
 	"os"
+	"sync"
 	"time"
 
 	crypto "github.com/libp2p/go-libp2p-core/crypto"
+	"github.com/libp2p/go-libp2p-core/peer"
 
 	pg "github.com/go-pg/pg/v10"
 	orm "github.com/go-pg/pg/v10/orm"
@@ -20,7 +22,6 @@ import (
 )
 
 const schema = "locations"
-const crawlTime = time.Duration(10) * time.Second
 
 //go:embed query.sql
 var query string
@@ -35,6 +36,7 @@ type minerInfo struct {
 	Latitude       int      `pg:",notnull"`
 	Longitude      int      `pg:",notnull"`
 	Source         string   `pg:",notnull"`
+	PeerID         string   `pg:"-"`
 }
 
 type minerInfos []minerInfo
@@ -75,12 +77,21 @@ func main() {
 		log.Fatal(err)
 	}
 
-	infos, err := getMinerInfos(db, fp)
+	infos, err := getMultiAddrsFromMinerInfos(db)
 	if err != nil {
 		log.Println("error obtaining list of miner infos")
 		log.Fatal(err)
 	}
 	log.Printf("found %d miners with defined addresses", len(infos))
+
+	infosFromDHT, err := getActiveMiners(db, fp)
+	if err != nil {
+		log.Println("error obtaining list of miner infos from dht")
+		log.Fatal(err)
+	}
+	log.Printf("found %d miners with defined addresses from dht", len(infosFromDHT))
+
+	infos = append(infos, infosFromDHT...)
 
 	infos, err = lookupLocations(ctx, loc, infos)
 	if err != nil {
@@ -168,70 +179,99 @@ func getLocator(ctx context.Context) (*ipfsgeoip.IPLocator, error) {
 	return ipfsgeoip.NewIPLocator(lite.Session(ctx)), nil
 }
 
-func getRouter(ctx context.Context) (*FilecoinPeer, error) {
-	fp, err := SetupFilecoinPeer(
+func getRouter(ctx context.Context) (*filecoinPeer, error) {
+	fp, err := setupFilecoinPeer(
 		ctx,
 		"mainnet",
 	)
 
 	if err != nil {
-		return &FilecoinPeer{}, nil
+		return &filecoinPeer{}, nil
 	}
 
-	fp.Crawl(crawlTime)
-
+	go fp.bootstrap()
 	return fp, nil
 }
 
-func getMinerInfos(db *pg.DB, fp *FilecoinPeer) ([]minerInfo, error) {
-	// Tl;dr: get latest known miner_id, multi_addresses, height for each
-	// miner.
-	knownPeers := fp.host.Peerstore().Peers()
+func getActiveMiners(db *pg.DB, fp *filecoinPeer) ([]minerInfo, error) {
+	var activeMiners []minerInfo
 
-	var infosFromDb []minerInfo
-	var infosFromFp []minerInfo = make([]minerInfo, len(knownPeers))
-
-	_, err := db.Query(&infosFromDb, query)
+	// get active miners in last two weeks, i.e.
+	// miners making power claims
+	_, err := db.Query(&activeMiners, `
+select
+  distinct on (pac.miner_id) pac.height,
+  pac.miner_id,
+  m.peer_id
+from
+  power_actor_claims pac
+join
+  miner_infos m on m.miner_id = pac.miner_id
+where
+  pac.height between current_height() - 40320 and current_height()
+  and m.peer_id != 'null'
+order by
+  pac.miner_id,
+  pac.height desc
+`)
 	if err != nil {
 		return nil, err
 	}
-	for _, info := range infosFromDb {
-		info.Source = "self-report"
+
+	found := make(chan struct{})
+
+	var wg sync.WaitGroup
+
+	for _, activeMiner := range activeMiners {
+		wg.Add(1)
+
+		go func(am minerInfo) {
+			defer wg.Done()
+
+			ctx, cancel := context.WithTimeout(context.Background(), time.Duration(15*time.Second))
+			defer cancel()
+
+			decodedPid, _ := peer.Decode(am.PeerID)
+			info, err := fp.dht.FindPeer(ctx, decodedPid)
+			if err != nil {
+				log.Println("could not find peer for ", am.PeerID)
+			}
+
+			peerAddrs := info.Addrs
+			peerAddrsAsStr := make([]string, len(peerAddrs))
+			for _, p := range peerAddrs {
+				peerAddrsAsStr = append(peerAddrsAsStr, p.String())
+			}
+
+			am.MultiAddresses = peerAddrsAsStr
+			am.Source = "dht"
+
+			found <- struct{}{}
+		}(activeMiner)
 	}
 
-	var height int64
-	if _, err := db.Model((*minerInfo)(nil)).QueryOne(pg.Scan(&height), `
-SELECT height FROM ?TableName
-ORDER BY height DESC
-LIMIT 1
-`); err != nil {
-		log.Println("could not find most recent height")
-		log.Fatal(err)
-	}
-	for _, peer := range knownPeers {
-		peerAddrs := fp.host.Peerstore().PeerInfo(peer).Addrs
-		peerAddrsAsStr := make([]string, len(peerAddrs))
-		for _, p := range peerAddrs {
-			peerAddrsAsStr = append(peerAddrsAsStr, p.String())
-		}
+	go func() {
+		wg.Wait()
+		close(found)
+	}()
 
-		info := minerInfo{
-			Height:         height,        // use most recent height from locations table for now
-			MinerID:        peer.String(), // cannot reliably get miner ID given a peer ID from miner_infos table
-			MultiAddresses: peerAddrsAsStr,
-		}
+	return activeMiners, nil
+}
 
-		if len(info.MultiAddresses) == 0 { // sometimes multiaddr not found in peerstore
-			continue
-		}
-
-		info.Source = "routing"
-		infosFromFp = append(infosFromFp, info)
+func getMultiAddrsFromMinerInfos(db *pg.DB) ([]minerInfo, error) {
+	// Tl;dr: get latest known miner_id, multi_addresses, height for each
+	// miner.
+	var infos []minerInfo
+	_, err := db.Query(&infos, query)
+	if err != nil {
+		return nil, err
 	}
 
-	log.Println("COUNT INFOS FROM FP")
-	log.Println(len(infosFromFp))
-	return append(infosFromDb, infosFromFp...), nil
+	for _, info := range infos {
+		info.Source = "self-reported"
+	}
+
+	return infos, nil
 }
 
 // We make the assumption that it does not make sense if a miner reports IPs
