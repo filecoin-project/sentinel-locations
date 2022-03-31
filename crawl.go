@@ -119,7 +119,7 @@ func setupFilecoinPeer(
 		libp2p.Security(noise.ID, noise.New),
 		libp2p.DefaultTransports,
 		libp2p.Routing(func(h host.Host) (routing.PeerRouting, error) {
-			ddht, err := dht.New(
+			ddht, err = dht.New(
 				ctx,
 				h,
 				dht.Option(dht.Datastore(dsync.MutexWrap(ds.NewMapDatastore()))),
