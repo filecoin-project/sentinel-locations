@@ -2,8 +2,9 @@ package main
 
 import (
 	"context"
-	"log"
 	"sync"
+
+	logging "github.com/ipfs/go-log/v2"
 
 	ds "github.com/ipfs/go-datastore"
 	dsync "github.com/ipfs/go-datastore/sync"
@@ -24,6 +25,8 @@ import (
 
 	protocol "github.com/libp2p/go-libp2p-core/protocol"
 )
+
+var log = logging.Logger("filecoin-peer")
 
 type networkName string
 
@@ -122,12 +125,12 @@ func setupFilecoinPeer(
 			ddht, err = dht.New(
 				ctx,
 				h,
-				dht.Option(dht.Datastore(dsync.MutexWrap(ds.NewMapDatastore()))),
-				dht.Option(dht.NamespacedValidator("pk", record.PublicKeyValidator{})),
-				dht.Option(dht.NamespacedValidator("ipns", ipns.Validator{KeyBook: h.Peerstore()})),
-				dht.Option(dht.Concurrency(50)),
-				dht.Option(dht.Mode(dht.ModeClient)),
-				dht.Option(dht.ProtocolPrefix(pp)),
+				dht.Datastore(dsync.MutexWrap(ds.NewMapDatastore())),
+				dht.NamespacedValidator("pk", record.PublicKeyValidator{}),
+				dht.NamespacedValidator("ipns", ipns.Validator{KeyBook: h.Peerstore()}),
+				dht.Concurrency(50),
+				dht.Mode(dht.ModeClient),
+				dht.ProtocolPrefix(pp),
 			)
 
 			return ddht, err
@@ -148,17 +151,18 @@ func (f *filecoinPeer) bootstrap() {
 
 	var wg sync.WaitGroup
 	for _, pinfo := range f.bootstrapPeers {
+		p := pinfo
 		wg.Add(1)
-		go func(p peer.AddrInfo) {
+		go func() {
 			defer wg.Done()
 			err := f.host.Connect(f.ctx, p)
 			if err != nil {
-				log.Println(err)
+				log.Warn(err)
 				return
 			}
-			log.Println("Connected to ", p.ID)
+			log.Infow("Connected", "ID", p.ID)
 			connected <- struct{}{}
-		}(pinfo)
+		}()
 	}
 
 	go func() {
