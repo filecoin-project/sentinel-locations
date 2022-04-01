@@ -212,18 +212,25 @@ func getActiveMiners(db *pg.DB, fp *filecoinPeer) <-chan minerInfo {
 	var wg sync.WaitGroup
 
 	for i, activeMiner := range activeMiners {
+		i, activeMiner := i, activeMiner
 		wg.Add(1)
 
-		go func(i int, am minerInfo) {
+		go func() {
 			defer wg.Done()
 
 			ctx, cancel := context.WithTimeout(context.Background(), time.Duration(15*time.Second))
 			defer cancel()
 
-			decodedPid, _ := peer.Decode(am.PeerID)
+			decodedPid, err := peer.Decode(activeMiner.PeerID)
+			if err != nil {
+				log.Println("error decoding peer ID ", activeMiner.PeerID)
+				return
+			}
+
 			info, err := fp.dht.FindPeer(ctx, decodedPid)
 			if err != nil {
-				log.Println("could not find peer for ", am.PeerID)
+				log.Println("could not find peer for ", activeMiner.PeerID)
+				return
 			} else {
 				peerAddrs := info.Addrs
 				peerAddrsAsStr := make([]string, len(peerAddrs))
@@ -232,10 +239,9 @@ func getActiveMiners(db *pg.DB, fp *filecoinPeer) <-chan minerInfo {
 				}
 				activeMiners[i].MultiAddresses = peerAddrsAsStr
 				activeMiners[i].Source = "dht"
+				found <- activeMiners[i]
 			}
-
-			found <- activeMiners[i]
-		}(i, activeMiner)
+		}()
 	}
 
 	go func() {
@@ -269,7 +275,6 @@ func lookupLocations(ctx context.Context, loc *ipfsgeoip.IPLocator, infos minerI
 	var locatedMiners minerInfos
 
 	for i, info := range infos {
-		log.Println(info)
 		for _, addr := range info.MultiAddresses {
 			ma, err := multiaddr.NewMultiaddr(addr)
 			if err != nil {
