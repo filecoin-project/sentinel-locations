@@ -3,16 +3,15 @@ package main
 import (
 	"context"
 	_ "embed"
-	"log"
 	"os"
 	"sync"
 	"time"
 
-	crypto "github.com/libp2p/go-libp2p-core/crypto"
-	"github.com/libp2p/go-libp2p-core/peer"
-
 	pg "github.com/go-pg/pg/v10"
 	orm "github.com/go-pg/pg/v10/orm"
+	logging "github.com/ipfs/go-log/v2"
+	crypto "github.com/libp2p/go-libp2p-core/crypto"
+	"github.com/libp2p/go-libp2p-core/peer"
 
 	ipfsgeoip "github.com/hsanjuan/go-ipfs-geoip"
 	ipfslite "github.com/hsanjuan/ipfs-lite"
@@ -20,6 +19,8 @@ import (
 	multiaddr "github.com/multiformats/go-multiaddr"
 	madns "github.com/multiformats/go-multiaddr-dns"
 )
+
+var log = logging.Logger("sentinel-locations")
 
 const schema = "locations"
 
@@ -61,38 +62,31 @@ func main() {
 
 	db, err := connectToDB()
 	if err != nil {
-		log.Println("error connecting to db")
-		log.Fatal(err)
+		log.Fatalw("error connection to db", "error", err)
 	}
 	defer db.Close()
 
 	fp, err := getRouter(ctx)
 	if err != nil {
-		log.Println("error setting up FilecoinPeer")
-		log.Fatal(err)
+		log.Fatalw("error setting up FilecoinPeer", "error", err)
 	}
 	defer fp.host.Close()
 
 	// This bootstraps IPFS while we get miner infos.
 	loc, err := getLocator(ctx)
 	if err != nil {
-		log.Println("error setting up ipfs-geoip lookups")
-		log.Fatal(err)
+		log.Fatalw("error setting up ipfs-geoip lookups", "error", err)
 	}
-
-	infosFromDHT := getActiveMiners(db, fp)
-	if err != nil {
-		log.Println("error obtaining list of miner infos from dht")
-		log.Fatal(err)
-	}
-	log.Printf("found %d miners with defined addresses from dht", len(infosFromDHT))
 
 	infos, err := getMultiAddrsFromMinerInfos(db)
 	if err != nil {
-		log.Println("error obtaining list of miner infos")
-		log.Fatal(err)
+		log.Fatalw("error obtaining list of miner infos", "error", err)
 	}
-	log.Printf("found %d miners with defined addresses", len(infos))
+
+	infosFromDHT, err := getActiveMiners(db, fp)
+	if err != nil {
+		log.Fatalw("error obtaining list of miner infos from dht", "error", err)
+	}
 
 	for info := range infosFromDHT {
 		infos = append(infos, info)
@@ -100,15 +94,12 @@ func main() {
 
 	infos, err = lookupLocations(ctx, loc, infos)
 	if err != nil {
-		log.Println("error looking up locations")
-		log.Fatal(err)
+		log.Fatalw("error looking up locations", "error", err)
 	}
-	log.Printf("found location information for %d miners", len(infos))
 
 	err = insert(ctx, db, infos)
 	if err != nil {
-		log.Println("error inserting miner location information")
-		log.Fatal(err)
+		log.Fatalw("error inserting miner location information", "error", err)
 	}
 
 }
@@ -191,59 +182,68 @@ func getRouter(ctx context.Context) (*filecoinPeer, error) {
 	)
 
 	if err != nil {
-		return &filecoinPeer{}, nil
+		return nil, err
 	}
 
 	return fp, nil
 }
 
-func getActiveMiners(db *pg.DB, fp *filecoinPeer) <-chan minerInfo {
+func getActiveMiners(db *pg.DB, fp *filecoinPeer) (<-chan minerInfo, error) {
 	go fp.bootstrap()
 
 	// get active miners in last two weeks, i.e.
 	// miners making power claims
+	// access concurrently
 	var activeMiners []minerInfo
 	_, err := db.Query(&activeMiners, activeMinersQuery)
 	if err != nil {
-		return nil
+		return nil, err
 	}
 
 	found := make(chan minerInfo)
 	var wg sync.WaitGroup
+	minersFound := 0
 
 	for i, activeMiner := range activeMiners {
-		wg.Add(1)
+		i := i
+		activeMiner := activeMiner
 
-		go func(i int, am minerInfo) {
+		wg.Add(1)
+		go func() {
 			defer wg.Done()
 
-			ctx, cancel := context.WithTimeout(context.Background(), time.Duration(15*time.Second))
+			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 			defer cancel()
 
-			decodedPid, _ := peer.Decode(am.PeerID)
+			decodedPid, err := peer.Decode(activeMiner.PeerID)
+			if err != nil {
+				log.Warnw("could not decode peerID ", "ID", activeMiner.PeerID, "error", err)
+			}
+
 			info, err := fp.dht.FindPeer(ctx, decodedPid)
 			if err != nil {
-				log.Println("could not find peer for ", am.PeerID)
+				log.Warnw("could not find peer", "ID", activeMiner.PeerID, "error", err)
 			} else {
-				peerAddrs := info.Addrs
-				peerAddrsAsStr := make([]string, len(peerAddrs))
-				for _, p := range peerAddrs {
-					peerAddrsAsStr = append(peerAddrsAsStr, p.String())
+				minersFound += 1
+				peerAddrsAsStr := make([]string, len(info.Addrs))
+				for i, p := range info.Addrs {
+					peerAddrsAsStr[i] = p.String()
 				}
 				activeMiners[i].MultiAddresses = peerAddrsAsStr
 				activeMiners[i].Source = "dht"
 			}
 
 			found <- activeMiners[i]
-		}(i, activeMiner)
+		}()
 	}
 
 	go func() {
 		wg.Wait()
+		log.Infof("found %d miners with defined addresses from dht", minersFound)
 		close(found)
 	}()
 
-	return found
+	return found, nil
 }
 
 func getMultiAddrsFromMinerInfos(db *pg.DB) ([]minerInfo, error) {
@@ -259,6 +259,7 @@ func getMultiAddrsFromMinerInfos(db *pg.DB) ([]minerInfo, error) {
 		infos[i].Source = "self-reported"
 	}
 
+	log.Infof("found %d miners with defined addresses", len(infos))
 	return infos, nil
 }
 
@@ -269,11 +270,11 @@ func lookupLocations(ctx context.Context, loc *ipfsgeoip.IPLocator, infos minerI
 	var locatedMiners minerInfos
 
 	for i, info := range infos {
-		log.Println(info)
+		log.Info(info)
 		for _, addr := range info.MultiAddresses {
 			ma, err := multiaddr.NewMultiaddr(addr)
 			if err != nil {
-				log.Println("error parsing multiaddress: ", err)
+				log.Warnw("error parsing multiaddress", "error", err)
 				continue
 			}
 			resolved, err := resolveMultiaddr(ctx, ma)
@@ -310,9 +311,10 @@ func lookupLocations(ctx context.Context, loc *ipfsgeoip.IPLocator, infos minerI
 			}
 		}
 		if i%100 == 0 {
-			log.Printf("Completed geo-lookup for %d out of %d (success on %d)", i+1, len(infos), len(locatedMiners))
+			log.Infof("Completed geo-lookup for %d out of %d (success on %d)", i+1, len(infos), len(locatedMiners))
 		}
 	}
+	log.Infof("found location information for %d miners", len(infos))
 	return locatedMiners, nil
 }
 
