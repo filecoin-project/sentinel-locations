@@ -26,6 +26,9 @@ const schema = "locations"
 //go:embed query.sql
 var query string
 
+//go:embed active_miners.sql
+var activeMinersQuery string
+
 type minerInfo struct {
 	//lint:ignore U1000 hit for go-pg
 	tableName      struct{} `pg:"locations.miners"`
@@ -35,7 +38,7 @@ type minerInfo struct {
 	CountryName    string   `pg:",notnull"`
 	Latitude       int      `pg:",notnull"`
 	Longitude      int      `pg:",notnull"`
-	Source         string   `pg:",notnull"`
+	Source         string   `pg:","`
 	PeerID         string   `pg:"-"`
 }
 
@@ -77,6 +80,13 @@ func main() {
 		log.Fatal(err)
 	}
 
+	infosFromDHT := getActiveMiners(db, fp)
+	if err != nil {
+		log.Println("error obtaining list of miner infos from dht")
+		log.Fatal(err)
+	}
+	log.Printf("found %d miners with defined addresses from dht", len(infosFromDHT))
+
 	infos, err := getMultiAddrsFromMinerInfos(db)
 	if err != nil {
 		log.Println("error obtaining list of miner infos")
@@ -84,14 +94,9 @@ func main() {
 	}
 	log.Printf("found %d miners with defined addresses", len(infos))
 
-	infosFromDHT, err := getActiveMiners(db, fp)
-	if err != nil {
-		log.Println("error obtaining list of miner infos from dht")
-		log.Fatal(err)
+	for info := range infosFromDHT {
+		infos = append(infos, info)
 	}
-	log.Printf("found %d miners with defined addresses from dht", len(infosFromDHT))
-
-	infos = append(infos, infosFromDHT...)
 
 	infos, err = lookupLocations(ctx, loc, infos)
 	if err != nil {
@@ -189,43 +194,27 @@ func getRouter(ctx context.Context) (*filecoinPeer, error) {
 		return &filecoinPeer{}, nil
 	}
 
-	go fp.bootstrap()
 	return fp, nil
 }
 
-func getActiveMiners(db *pg.DB, fp *filecoinPeer) ([]minerInfo, error) {
-	var activeMiners []minerInfo
+func getActiveMiners(db *pg.DB, fp *filecoinPeer) <-chan minerInfo {
+	go fp.bootstrap()
 
 	// get active miners in last two weeks, i.e.
 	// miners making power claims
-	_, err := db.Query(&activeMiners, `
-select
-  distinct on (pac.miner_id) pac.height,
-  pac.miner_id,
-  m.peer_id
-from
-  power_actor_claims pac
-join
-  miner_infos m on m.miner_id = pac.miner_id
-where
-  pac.height between current_height() - 40320 and current_height()
-  and m.peer_id != 'null'
-order by
-  pac.miner_id,
-  pac.height desc
-`)
+	var activeMiners []minerInfo
+	_, err := db.Query(&activeMiners, activeMinersQuery)
 	if err != nil {
-		return nil, err
+		return nil
 	}
 
-	found := make(chan struct{})
-
+	found := make(chan minerInfo)
 	var wg sync.WaitGroup
 
-	for _, activeMiner := range activeMiners {
+	for i, activeMiner := range activeMiners {
 		wg.Add(1)
 
-		go func(am minerInfo) {
+		go func(i int, am minerInfo) {
 			defer wg.Done()
 
 			ctx, cancel := context.WithTimeout(context.Background(), time.Duration(15*time.Second))
@@ -235,19 +224,18 @@ order by
 			info, err := fp.dht.FindPeer(ctx, decodedPid)
 			if err != nil {
 				log.Println("could not find peer for ", am.PeerID)
+			} else {
+				peerAddrs := info.Addrs
+				peerAddrsAsStr := make([]string, len(peerAddrs))
+				for _, p := range peerAddrs {
+					peerAddrsAsStr = append(peerAddrsAsStr, p.String())
+				}
+				activeMiners[i].MultiAddresses = peerAddrsAsStr
+				activeMiners[i].Source = "dht"
 			}
 
-			peerAddrs := info.Addrs
-			peerAddrsAsStr := make([]string, len(peerAddrs))
-			for _, p := range peerAddrs {
-				peerAddrsAsStr = append(peerAddrsAsStr, p.String())
-			}
-
-			am.MultiAddresses = peerAddrsAsStr
-			am.Source = "dht"
-
-			found <- struct{}{}
-		}(activeMiner)
+			found <- activeMiners[i]
+		}(i, activeMiner)
 	}
 
 	go func() {
@@ -255,7 +243,7 @@ order by
 		close(found)
 	}()
 
-	return activeMiners, nil
+	return found
 }
 
 func getMultiAddrsFromMinerInfos(db *pg.DB) ([]minerInfo, error) {
@@ -267,8 +255,8 @@ func getMultiAddrsFromMinerInfos(db *pg.DB) ([]minerInfo, error) {
 		return nil, err
 	}
 
-	for _, info := range infos {
-		info.Source = "self-reported"
+	for i := range infos {
+		infos[i].Source = "self-reported"
 	}
 
 	return infos, nil
@@ -281,6 +269,7 @@ func lookupLocations(ctx context.Context, loc *ipfsgeoip.IPLocator, infos minerI
 	var locatedMiners minerInfos
 
 	for i, info := range infos {
+		log.Println(info)
 		for _, addr := range info.MultiAddresses {
 			ma, err := multiaddr.NewMultiaddr(addr)
 			if err != nil {
