@@ -180,8 +180,8 @@ func (f *filecoinPeer) bootstrap() error {
 	return nil
 }
 
-func (f *filecoinPeer) findPeersWithDHT(m minerWithDecodedPeerID) (minerInfo, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(5*time.Second))
+func (f *filecoinPeer) findPeersWithDHT(ctx context.Context, m minerWithDecodedPeerID) (minerInfo, error) {
+	ctx, cancel := context.WithTimeout(ctx, time.Duration(5*time.Second))
 	defer cancel()
 
 	info, err := f.dht.FindPeer(ctx, m.decodedPeerID)

@@ -3,11 +3,8 @@ package main
 import (
 	"context"
 	_ "embed"
-	"github.com/libp2p/go-libp2p-core/peer"
-	"golang.org/x/sync/semaphore"
 	"os"
 	"runtime"
-	"sync"
 	"time"
 
 	pg "github.com/go-pg/pg/v10"
@@ -206,45 +203,43 @@ func getActiveMiners(db *pg.DB, fp *filecoinPeer) ([]minerInfo, error) {
 		return nil, err
 	}
 
+	if len(activeMiners) < 1 {
+		// TODO should this be an error?
+		return nil, nil
+	}
+
 	var (
+		ctx        = context.Background()
 		found      = make([]minerInfo, len(activeMiners))
-		peerIDs    = make(chan minerWithDecodedPeerID, 50)
-		wg         = sync.WaitGroup{}
-		maxWorkers = runtime.GOMAXPROCS(0)
-		sem        = semaphore.NewWeighted(int64(maxWorkers))
+		maxWorkers = int64(runtime.NumCPU() * 8)
+		out        = make(chan minerInfo)
 	)
-	for i := range activeMiners {
 
-		miner := activeMiners[i]
-
-		decodedPid, err := peer.Decode(miner.PeerID)
-		if err != nil {
-			log.Warnw("could not decode peer ID ", "ID", miner.PeerID, "error", err)
-		}
-		peerIDs <- minerWithDecodedPeerID{miner: miner, decodedPeerID: decodedPid}
-
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			if err := sem.Acquire(fp.ctx, 1); err != nil {
-				log.Warnw("Failed to acquire semaphore: ", err)
-			}
-			defer sem.Release(1)
-			f, err := fp.findPeersWithDHT(<-peerIDs)
-			if err != nil {
-				return
-			}
-			found = append(found, f)
-		}()
+	mr, ctx := newParallelMinerRouter(ctx, maxWorkers, &task{miner: activeMiners[0]})
+	mr.startScheduler(ctx)
+	mr.startWorkers(ctx, out)
+	for _, miner := range activeMiners {
+		mr.enqueueTask(&task{miner})
 	}
 
+	done := make(chan struct{})
 	go func() {
-		wg.Wait()
+		// drain out until the channel is closed
+		for miner := range out {
+			found = append(found, miner)
+		}
+		close(done)
 	}()
-	if err := sem.Acquire(fp.ctx, int64(maxWorkers)); err != nil {
-		log.Warnw("Failed to acquire semaphore: %v", err)
-	}
-	return found, nil
+
+	// wait for mr to complete
+	err = mr.grp.Wait()
+	// signal above go routine to stop draining out channel
+	close(out)
+	// wait for above go routine to drain channel
+	<-done
+
+	// return miner infos found and any error
+	return found, err
 }
 
 func getMultiAddrsFromMinerInfos(db *pg.DB) ([]minerInfo, error) {
