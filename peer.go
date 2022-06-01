@@ -149,8 +149,6 @@ func setupFilecoinPeer(
 }
 
 func (f *filecoinPeer) bootstrap() error {
-	connected := make(chan struct{})
-
 	var wg sync.WaitGroup
 	for _, pinfo := range f.bootstrapPeers {
 		p := pinfo
@@ -163,13 +161,11 @@ func (f *filecoinPeer) bootstrap() error {
 				return
 			}
 			log.Infow("Connected", "ID", p.ID)
-			connected <- struct{}{}
 		}()
 	}
 
 	go func() {
 		wg.Wait()
-		close(connected)
 	}()
 
 	err := f.dht.Bootstrap(f.ctx)
