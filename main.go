@@ -3,10 +3,10 @@ package main
 import (
 	"context"
 	_ "embed"
-	logging "github.com/ipfs/go-log/v2"
-	crypto "github.com/libp2p/go-libp2p-core/crypto"
-	peer "github.com/libp2p/go-libp2p-core/peer"
+	"github.com/libp2p/go-libp2p-core/peer"
+	"golang.org/x/sync/semaphore"
 	"os"
+	"runtime"
 	"sync"
 	"time"
 
@@ -18,6 +18,9 @@ import (
 
 	multiaddr "github.com/multiformats/go-multiaddr"
 	madns "github.com/multiformats/go-multiaddr-dns"
+
+	logging "github.com/ipfs/go-log/v2"
+	crypto "github.com/libp2p/go-libp2p-core/crypto"
 )
 
 var log = logging.Logger("sentinel-locations")
@@ -88,7 +91,7 @@ func main() {
 		log.Fatalw("error obtaining list of miner infos", "error", err)
 	}
 
-	for info := range infosFromDHT {
+	for _, info := range infosFromDHT {
 		infos = append(infos, info)
 	}
 
@@ -189,8 +192,10 @@ func getRouter(ctx context.Context) (*filecoinPeer, error) {
 	return fp, nil
 }
 
-func getActiveMiners(db *pg.DB, fp *filecoinPeer) (<-chan minerInfo, error) {
-	go fp.bootstrap()
+func getActiveMiners(db *pg.DB, fp *filecoinPeer) ([]minerInfo, error) {
+	if err := fp.bootstrap(); err != nil {
+		log.Fatalw("error bootstrapping dht", err)
+	}
 
 	// get active miners in last two weeks, i.e.
 	// miners making power claims
@@ -201,49 +206,50 @@ func getActiveMiners(db *pg.DB, fp *filecoinPeer) (<-chan minerInfo, error) {
 		return nil, err
 	}
 
-	found := make(chan minerInfo)
-	var wg sync.WaitGroup
-	minersFound := 0
+	var (
+		found       = make([]minerInfo, len(activeMiners)) // TODO: make to slice
+		peerIDs     = make(chan minerWithDecodedPeerID, 50)
+		minersFound = 0
+		wg          = sync.WaitGroup{}
+		maxWorkers  = runtime.GOMAXPROCS(0)
+		sem         = semaphore.NewWeighted(int64(maxWorkers))
+	)
+	//sema := make(chan struct{}, runtime.NumCPU())
+	for i := range activeMiners {
 
-	for i, activeMiner := range activeMiners {
-		i, activeMiner := i, activeMiner
+		miner := activeMiners[i]
+
+		decodedPid, err := peer.Decode(miner.PeerID)
+		if err != nil {
+			log.Warnw("could not decode peer ID ", "ID", miner.PeerID, "error", err)
+		}
+		peerIDs <- minerWithDecodedPeerID{miner: miner, decodedPeerID: decodedPid}
+
 		wg.Add(1)
-
 		go func() {
 			defer wg.Done()
-
-			ctx, cancel := context.WithTimeout(context.Background(), time.Duration(15*time.Second))
-			defer cancel()
-
-			decodedPid, err := peer.Decode(activeMiner.PeerID)
+			if err := sem.Acquire(fp.ctx, 1); err != nil {
+				log.Warnw("Failed to acquire semaphore: ", err)
+			}
+			defer sem.Release(1)
+			//sema <- struct{}{}
+			f, err := fp.findPeersWithDHT(<-peerIDs)
 			if err != nil {
-				log.Warnw("could not decode peer ID ", "ID", activeMiner.PeerID, "error", err)
 				return
 			}
-
-			info, err := fp.dht.FindPeer(ctx, decodedPid)
-			if err != nil {
-				log.Warnw("could not find peer for ", "ID", activeMiner.PeerID, "error", err)
-			} else {
-				minersFound++
-				peerAddrs := info.Addrs
-				peerAddrsAsStr := make([]string, len(peerAddrs))
-				for i, p := range peerAddrs {
-					peerAddrsAsStr[i] = p.String()
-				}
-				activeMiners[i].MultiAddresses = peerAddrsAsStr
-				activeMiners[i].Source = "dht"
-				found <- activeMiners[i]
-			}
+			found = append(found, f)
+			minersFound++
+			//<-sema
 		}()
 	}
 
 	go func() {
 		wg.Wait()
-		log.Infof("found %d miners with defined addresses from dht", minersFound)
-		close(found)
+		//log.Infof("found %d miners with defined addresses from dht", minersFound)
 	}()
-
+	if err := sem.Acquire(fp.ctx, int64(maxWorkers)); err != nil {
+		log.Warnw("Failed to acquire semaphore: %v", err)
+	}
 	return found, nil
 }
 

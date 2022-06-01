@@ -3,8 +3,7 @@ package main
 import (
 	"context"
 	"sync"
-
-	logging "github.com/ipfs/go-log/v2"
+	"time"
 
 	ds "github.com/ipfs/go-datastore"
 	dsync "github.com/ipfs/go-datastore/sync"
@@ -25,8 +24,6 @@ import (
 
 	protocol "github.com/libp2p/go-libp2p-core/protocol"
 )
-
-var log = logging.Logger("filecoin-peer")
 
 type networkName string
 
@@ -66,6 +63,11 @@ type filecoinPeer struct {
 	host           host.Host
 	bootstrapPeers []peer.AddrInfo
 	foundMiners    []peer.AddrInfo
+}
+
+type minerWithDecodedPeerID struct {
+	miner         minerInfo
+	decodedPeerID peer.ID
 }
 
 func filecoinBootstrapPeers(peerList []string) []peer.AddrInfo {
@@ -146,7 +148,7 @@ func setupFilecoinPeer(
 	return &filecoinPeer{ctx: ctx, host: h, dht: ddht, bootstrapPeers: bootstrapPeers}, nil
 }
 
-func (f *filecoinPeer) bootstrap() {
+func (f *filecoinPeer) bootstrap() error {
 	connected := make(chan struct{})
 
 	var wg sync.WaitGroup
@@ -169,4 +171,31 @@ func (f *filecoinPeer) bootstrap() {
 		wg.Wait()
 		close(connected)
 	}()
+
+	err := f.dht.Bootstrap(f.ctx)
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (f *filecoinPeer) findPeersWithDHT(m minerWithDecodedPeerID) (minerInfo, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(5*time.Second))
+	defer cancel()
+
+	info, err := f.dht.FindPeer(ctx, m.decodedPeerID)
+	if err != nil {
+		log.Warnw("could not find peer for ", "ID", m.decodedPeerID, "error", err)
+		return minerInfo{}, err
+	} else {
+		peerAddrs := info.Addrs
+		peerAddrsAsStr := make([]string, len(peerAddrs))
+		for i, p := range peerAddrs {
+			peerAddrsAsStr[i] = p.String()
+		}
+		m.miner.MultiAddresses = peerAddrsAsStr
+		m.miner.Source = "dht"
+		return m.miner, nil
+	}
 }

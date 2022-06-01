@@ -18,5 +18,5 @@ require (
 	github.com/libp2p/go-libp2p-tls v0.3.1
 	github.com/multiformats/go-multiaddr v0.4.1
 	github.com/multiformats/go-multiaddr-dns v0.3.1
-
+	golang.org/x/sync v0.0.0-20210220032951-036812b2e83c
 )
