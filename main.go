@@ -207,14 +207,12 @@ func getActiveMiners(db *pg.DB, fp *filecoinPeer) ([]minerInfo, error) {
 	}
 
 	var (
-		found       = make([]minerInfo, len(activeMiners)) // TODO: make to slice
-		peerIDs     = make(chan minerWithDecodedPeerID, 50)
-		minersFound = 0
-		wg          = sync.WaitGroup{}
-		maxWorkers  = runtime.GOMAXPROCS(0)
-		sem         = semaphore.NewWeighted(int64(maxWorkers))
+		found      = make([]minerInfo, len(activeMiners))
+		peerIDs    = make(chan minerWithDecodedPeerID, 50)
+		wg         = sync.WaitGroup{}
+		maxWorkers = runtime.GOMAXPROCS(0)
+		sem        = semaphore.NewWeighted(int64(maxWorkers))
 	)
-	//sema := make(chan struct{}, runtime.NumCPU())
 	for i := range activeMiners {
 
 		miner := activeMiners[i]
@@ -232,20 +230,16 @@ func getActiveMiners(db *pg.DB, fp *filecoinPeer) ([]minerInfo, error) {
 				log.Warnw("Failed to acquire semaphore: ", err)
 			}
 			defer sem.Release(1)
-			//sema <- struct{}{}
 			f, err := fp.findPeersWithDHT(<-peerIDs)
 			if err != nil {
 				return
 			}
 			found = append(found, f)
-			minersFound++
-			//<-sema
 		}()
 	}
 
 	go func() {
 		wg.Wait()
-		//log.Infof("found %d miners with defined addresses from dht", minersFound)
 	}()
 	if err := sem.Acquire(fp.ctx, int64(maxWorkers)); err != nil {
 		log.Warnw("Failed to acquire semaphore: %v", err)
